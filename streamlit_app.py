@@ -1,206 +1,312 @@
 import streamlit as st
 import requests
-from typing import Dict, Optional
-import time
-from datetime import datetime
+import base64
+from pathlib import Path
+import tempfile
+import orjson
+from typing import Generator, Dict, Any, Optional, List
 import json
-import os
+from datetime import datetime
+import io
+from PIL import Image
 
-class APIHandler:
-    def __init__(self, api_key: str):
-        self.headers = {"Authorization": f"Bearer {api_key}"}
-        self.base_urls = {
-            "chat": "https://api.electronhub.top/chat/completions",
-            "audio": "https://api.electronhub.top/audio/speech",
-            "image": "https://api.electronhub.top/images/generations"
-        }
-        
-    def make_request(self, endpoint: str, payload: Dict) -> Optional[requests.Response]:
-        try:
-            response = requests.post(
-                self.base_urls[endpoint],
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as e:
-            st.error(f"API Error: {str(e)}")
-            return None
-
-class Cache:
+class EnhancedAPIClient:
+    """Enhanced API client supporting streaming and multimedia"""
+    
     def __init__(self):
-        self.cache_file = "response_cache.json"
-        self.cache = self.load_cache()
+        self.base_url = "https://api.electronhub.top"
+        self.api_key = st.secrets["API_KEY"]
+        self.headers = {"Authorization": f"Bearer {self.api_key}"}
         
-    def load_cache(self) -> Dict:
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r') as f:
-                    return json.load(f)
-            except json.JSONDecodeError:
-                return {}
-        return {}
-    
-    def save_cache(self):
-        with open(self.cache_file, 'w') as f:
-            json.dump(self.cache, f)
-            
-    def get_cached_response(self, key: str) -> Optional[Dict]:
-        if key in self.cache:
-            # Check if cache is less than 24 hours old
-            timestamp = self.cache[key]["timestamp"]
-            if time.time() - timestamp < 86400:  # 24 hours
-                return self.cache[key]["data"]
-        return None
-    
-    def cache_response(self, key: str, data: Dict):
-        self.cache[key] = {
-            "timestamp": time.time(),
-            "data": data
+    def stream_completion(
+        self, 
+        messages: List[Dict], 
+        model: str = "gpt-4",
+        max_tokens: Optional[int] = None,
+        include_usage: bool = False
+    ) -> Generator[str, None, None]:
+        """Stream completion responses"""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": include_usage}
         }
-        self.save_cache()
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+            
+        with requests.post(
+            f"{self.base_url}/chat/completions",
+            headers=self.headers,
+            json=payload,
+            stream=True
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    chunk = json.loads(line)
+                    if "choices" in chunk:
+                        yield chunk["choices"][0]["delta"].get("content", "")
+
+    def analyze_image(self, image: bytes, prompt: str) -> str:
+        """Analyze image using vision model"""
+        base64_image = base64.b64encode(image).decode('utf-8')
+        
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }]
+        }
+        
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers=self.headers,
+            json=payload
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    def generate_speech(self, text: str) -> bytes:
+        """Generate speech from text"""
+        payload = {
+            "model": "eleven-multilingual-v2",
+            "voice": "nova",
+            "input": text
+        }
+        
+        response = requests.post(
+            f"{self.base_url}/audio/speech",
+            headers=self.headers,
+            json=payload
+        )
+        response.raise_for_status()
+        return response.content
+
+    def generate_video(self, prompt: str) -> str:
+        """Generate video from prompt"""
+        payload = {
+            "model": "t2v-turbo",
+            "prompt": prompt
+        }
+        
+        with requests.post(
+            f"{self.base_url}/videos/generations",
+            headers=self.headers,
+            json=payload,
+            stream=True
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    data = orjson.loads(line)
+                    if "data" in data:
+                        return data["data"][0]["url"]
+            return ""
 
 class EngineeringTutor:
+    """Enhanced Engineering Tutor with multimedia capabilities"""
+    
     def __init__(self):
-        self.setup_streamlit()
-        self.api = APIHandler(st.secrets["API_KEY"])
-        self.cache = Cache()
+        self.api = EnhancedAPIClient()
+        self.initialize_session_state()
+        self.setup_ui()
         
-    def setup_streamlit(self):
+    def initialize_session_state(self):
+        """Initialize session state variables"""
+        if 'history' not in st.session_state:
+            st.session_state.history = []
+        if 'current_explanation' not in st.session_state:
+            st.session_state.current_explanation = ""
+            
+    def setup_ui(self):
+        """Setup the Streamlit UI"""
         st.set_page_config(
-            page_title="AI Engineering Tutor",
+            page_title="Engineering Learning Hub",
             page_icon="🎓",
             layout="wide"
         )
-        st.title("🎓 AI Engineering Tutor")
-        st.subheader("Master engineering concepts with interactive AI assistance!")
         
-        # Add sidebar for settings and information
+        st.markdown("""
+            <style>
+                .stApp { max-width: 1200px; margin: 0 auto; }
+                .explanation-container { height: 400px; overflow-y: auto; }
+                .multimedia-container { padding: 10px; border: 1px solid #ddd; }
+            </style>
+        """, unsafe_allow_html=True)
+        
+    def run(self):
+        """Run the main application"""
+        st.title("🎓 Advanced Engineering Learning Hub")
+        
+        # Sidebar settings
         with st.sidebar:
-            st.markdown("### About")
-            st.info(
-                "This app uses AI to explain engineering concepts through "
-                "text, audio, and visual representations."
+            st.title("⚙️ Settings")
+            model = st.selectbox(
+                "Select Model",
+                ["gpt-4", "gpt-3.5-turbo", "gemma-7b"]
             )
-            st.markdown("### Settings")
-            st.session_state.difficulty = st.select_slider(
-                "Explanation Difficulty",
+            depth = st.select_slider(
+                "Learning Depth",
                 options=["Beginner", "Intermediate", "Advanced"]
             )
             
-    def get_explanation_prompt(self, topic: str) -> str:
-        difficulty_prompts = {
-            "Beginner": "Explain {topic} in simple terms, using everyday examples.",
-            "Intermediate": "Explain {topic} with technical details and practical applications.",
-            "Advanced": "Provide an in-depth explanation of {topic} with mathematical formulas and advanced concepts."
-        }
-        return difficulty_prompts[st.session_state.difficulty].format(topic=topic)
-    
-    def generate_text_explanation(self, topic: str) -> Optional[str]:
-        cache_key = f"text_{topic}_{st.session_state.difficulty}"
-        cached_response = self.cache.get_cached_response(cache_key)
-        
-        if cached_response:
-            return cached_response
-            
-        payload = {
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": self.get_explanation_prompt(topic)}]
-        }
-        
-        response = self.api.make_request("chat", payload)
-        if response:
-            explanation = response.json()["choices"][0]["message"]["content"]
-            self.cache.cache_response(cache_key, explanation)
-            return explanation
-        return None
-    
-    def generate_audio_explanation(self, topic: str) -> Optional[str]:
-        cache_key = f"audio_{topic}_{st.session_state.difficulty}"
-        cached_response = self.cache.get_cached_response(cache_key)
-        
-        if cached_response:
-            return cached_response
-            
-        payload = {
-            "text": self.get_explanation_prompt(topic),
-            "voice": "en-US-Wavenet-D"
-        }
-        
-        response = self.api.make_request("audio", payload)
-        if response:
-            audio_url = response.json()["url"]
-            self.cache.cache_response(cache_key, audio_url)
-            return audio_url
-        return None
-    
-    def generate_image_visualization(self, topic: str) -> Optional[str]:
-        cache_key = f"image_{topic}_{st.session_state.difficulty}"
-        cached_response = self.cache.get_cached_response(cache_key)
-        
-        if cached_response:
-            return cached_response
-            
-        payload = {
-            "prompt": f"Technical diagram or visualization of {topic} in engineering context"
-        }
-        
-        response = self.api.make_request("image", payload)
-        if response:
-            image_url = response.json()["data"][0]["url"]
-            self.cache.cache_response(cache_key, image_url)
-            return image_url
-        return None
-    
-    def run(self):
-        # Create two columns for input
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            topic = st.text_input(
-                "Enter an engineering topic:",
-                placeholder="e.g., Bernoulli's Principle, Fluid Mechanics"
+            st.title("📚 Learning Tools")
+            tool_type = st.radio(
+                "Select Learning Mode",
+                ["Text", "Image Analysis", "Interactive", "Video"]
             )
+        
+        # Main content area
+        if tool_type == "Text":
+            self.render_text_mode(model, depth)
+        elif tool_type == "Image Analysis":
+            self.render_image_mode()
+        elif tool_type == "Interactive":
+            self.render_interactive_mode(model)
+        elif tool_type == "Video":
+            self.render_video_mode()
             
-        with col2:
-            output_type = st.multiselect(
-                "Select output formats:",
-                ["Text", "Audio", "Image"],
-                default=["Text"]
-            )
-            
-        if st.button("Generate Explanation", type="primary"):
+    def render_text_mode(self, model: str, depth: str):
+        """Render text-based learning mode"""
+        topic = st.text_input("Enter engineering topic:")
+        
+        if st.button("Start Learning", type="primary"):
             if not topic:
-                st.error("Please enter a topic.")
+                st.error("Please enter a topic!")
                 return
                 
-            with st.spinner("Generating response..."):
-                # Create tabs for different output formats
-                if output_type:
-                    tabs = st.tabs(output_type)
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"You are an engineering tutor explaining at {depth} level."
+                },
+                {
+                    "role": "user",
+                    "content": f"Explain {topic} with examples and applications."
+                }
+            ]
+            
+            # Create placeholder for streaming text
+            explanation_placeholder = st.empty()
+            full_response = ""
+            
+            # Stream the response
+            for chunk in self.api.stream_completion(messages, model):
+                full_response += chunk
+                explanation_placeholder.markdown(full_response + "▌")
+            explanation_placeholder.markdown(full_response)
+            
+            # Generate audio version
+            if st.button("🔊 Listen to Explanation"):
+                with st.spinner("Generating audio..."):
+                    audio_data = self.api.generate_speech(full_response)
+                    st.audio(audio_data)
                     
-                    for tab, format_type in zip(tabs, output_type):
-                        with tab:
-                            if format_type == "Text":
-                                explanation = self.generate_text_explanation(topic)
-                                if explanation:
-                                    st.markdown(explanation)
-                                    
-                            elif format_type == "Audio":
-                                audio_url = self.generate_audio_explanation(topic)
-                                if audio_url:
-                                    st.audio(audio_url)
-                                    
-                            elif format_type == "Image":
-                                image_url = self.generate_image_visualization(topic)
-                                if image_url:
-                                    st.image(image_url, caption=f"Visualization of {topic}")
-                                    
-        # Add footer with timestamp
-        st.markdown("---")
-        st.markdown(f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    def render_image_mode(self):
+        """Render image analysis mode"""
+        uploaded_file = st.file_uploader(
+            "Upload an engineering diagram or schema",
+            type=["png", "jpg", "jpeg"]
+        )
+        
+        if uploaded_file:
+            image_bytes = uploaded_file.getvalue()
+            st.image(image_bytes, caption="Uploaded Image")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Analyze Diagram"):
+                    with st.spinner("Analyzing..."):
+                        analysis = self.api.analyze_image(
+                            image_bytes,
+                            "Explain this engineering diagram in detail."
+                        )
+                        st.markdown(analysis)
+            
+            with col2:
+                if st.button("Identify Components"):
+                    with st.spinner("Identifying..."):
+                        components = self.api.analyze_image(
+                            image_bytes,
+                            "List and explain each component in this diagram."
+                        )
+                        st.markdown(components)
+                        
+    def render_interactive_mode(self, model: str):
+        """Render interactive learning mode"""
+        st.subheader("Interactive Learning Session")
+        
+        if "messages" not in st.session_state:
+            st.session_state.messages = [
+                {
+                    "role": "system",
+                    "content": "You are an interactive engineering tutor."
+                }
+            ]
+        
+        for message in st.session_state.messages[1:]:  # Skip system message
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                
+        prompt = st.chat_input("Ask your engineering question")
+        
+        if prompt:
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            
+            with st.chat_message("user"):
+                st.markdown(prompt)
+                
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                full_response = ""
+                
+                for chunk in self.api.stream_completion(
+                    st.session_state.messages,
+                    model
+                ):
+                    full_response += chunk
+                    message_placeholder.markdown(full_response + "▌")
+                message_placeholder.markdown(full_response)
+                
+            st.session_state.messages.append(
+                {"role": "assistant", "content": full_response}
+            )
+            
+    def render_video_mode(self):
+        """Render video-based learning mode"""
+        st.subheader("Video Visualization")
+        
+        topic = st.text_input(
+            "Enter engineering concept for visualization:",
+            placeholder="e.g., How a four-stroke engine works"
+        )
+        
+        if st.button("Generate Video"):
+            if not topic:
+                st.error("Please enter a topic!")
+                return
+                
+            with st.spinner("Generating video visualization..."):
+                try:
+                    video_url = self.api.generate_video(
+                        f"Technical visualization of {topic}"
+                    )
+                    if video_url:
+                        st.video(video_url)
+                    else:
+                        st.error("Video generation failed. Please try again.")
+                except Exception as e:
+                    st.error(f"Error generating video: {str(e)}")
 
 if __name__ == "__main__":
     tutor = EngineeringTutor()
